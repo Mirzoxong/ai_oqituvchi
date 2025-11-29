@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Ingliz Tili O'qituvchisi</title>
+    <!-- Chart.js grafikalar uchun ishlatiladi -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Firebase modul importlari -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Global o'zgaruvchilar
+        let app, db, auth, userId;
+        // Barcha progress 0% dan boshlanadi
+        let studentInfo = { name: '', age: 0, level: 'boshlang\'ich', progress: { vocabulary: 0, grammar: 0, fluency: 0 } }; 
+        let conversationHistory = []; // Suhbat tarixi
+        let teacherGender = 'male'; // O'qituvchi jinsi: 'male' yoki 'female'
+        let currentTopic = 'Tanishtiruv'; // Joriy mavzu
+        let recognition; // Web Speech Recognition obyekti
+        let chartInstance; // Chart.js grafik obyekti
+        let teacherVoice; // TTS uchun tanlangan ovoz obyekti
+        let isTaskPending = false; // Hozirda topshiriq bajarilishi kutilayotganini ko'rsatadi
+
+        // HTML elementlarga murojaatlar
+        const chatBox = document.getElementById('chat-box');
+        const messageInput = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const teacherAvatar = document.getElementById('teacher-avatar');
+        const teacherName = document.getElementById('teacher-name');
+        const teacherGenderToggle = document.getElementById('teacher-gender-toggle');
+        const topicButtonsContainer = document.getElementById('topic-buttons');
+        const progressChartCanvas = document.getElementById('progress-chart');
+
+        // ====================================================================
+        // FUNKSIYALAR: Ovozni Boshqarish (TTS Voice Selection)
+        // ====================================================================
+
+        /**
+         * Brauzerda mavjud TTS ovozlaridan eng mos keladigan inglizcha ovozni topadi.
+         * Ovoz sifati va jinsiga ustuvorlik beriladi.
+         */
+        function findTeacherVoice(gender) {
+            if (!('speechSynthesis' in window) || window.speechSynthesis.getVoices().length === 0) {
+                // Agar ovozlar hali yuklanmagan bo'lsa, kutish kerak
+                return;
+            }
+
+            const isMale = gender === 'male';
+            const voices = window.speechSynthesis.getVoices().filter(v => v.lang.startsWith('en'));
+
+            // Ovoz tanlash tartibi:
+            // 1. Google US/UK ovozi (sifatli va tushunarli)
+            let selectedVoice = voices.find(v => 
+                (v.name.includes('Google') || v.name.includes('Samantha') || v.name.includes('Daniel')) && 
+                (isMale ? !v.name.includes('Female') : v.name.includes('Female'))
+            );
+
+            // 2. US/UK standart ovoz (Fallbek)
+            if (!selectedVoice) {
+                selectedVoice = voices.find(v => 
+                    (v.name.includes('US') || v.name.includes('UK')) && 
+                    (isMale ? !v.name.includes('Female') : v.name.includes('Female'))
+                );
+            }
+            
+            // 3. Jinsga mos keladigan birinchi inglizcha ovoz (Qattiq Fallbek)
+            if (!selectedVoice) {
+                selectedVoice = voices.find(v => isMale ? !v.name.includes('Female') : v.name.includes('Female'));
+            }
+
+            // 4. Mutlaq Fallbek: birinchi topilgan inglizcha ovoz
+            if (!selectedVoice && voices.length > 0) {
+                selectedVoice = voices[0];
+            }
+            
+            teacherVoice = selectedVoice;
+            if (teacherVoice) {
+                console.log(`TTS Ovoz tanlandi: ${teacherVoice.name}`);
+            } else {
+                console.warn("Inglizcha TTS ovoz topilmadi. Brauzer default ovozidan foydalaniladi.");
+            }
+        }
+
+        /**
+         * Ovoz yozish (Text-to-Speech) uchun. Ovoz aniq va tushunarli bo'lishi kerak.
+         * @param {string} text O'qilishi kerak bo'lgan matn.
+         */
+        function speak(text) {
+            if ('speechSynthesis' in window) {
+                // Ovoz yuklanmagan bo'lsa, uni topish
+                if (!teacherVoice) {
+                    findTeacherVoice(teacherGender);
+                }
+
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = 'en-US'; 
+                utterance.rate = 0.9; // O'qish tezligini biroz sekinlashtirish (tushunarlilik uchun)
+                if (teacherVoice) {
+                    utterance.voice = teacherVoice;
+                }
+
+                // AI matnining faqat inglizcha qismini TTS o'qishi uchun sodda filtr.
+                // Bu o'zbekcha tahlil qismini o'qimasligini ta'minlaydi.
+                const englishTextMatch = text.match(/[a-zA-Z\s.,?!'"\(\)]+/g);
+                const englishText = englishTextMatch ? englishTextMatch.join(' ') : '';
+                
+                if(englishText.trim().length > 0 && englishText.length > text.length / 4) {
+                     utterance.text = englishText;
+                     
+                     // O'qituvchi avatarini animatsiya qilish
+                     const avatar = document.getElementById('teacher-avatar');
+                     avatar.classList.add('speaking');
+                     utterance.onend = () => {
+                         avatar.classList.remove('speaking');
+                     };
+                     utterance.onerror = (e) => {
+                         console.error('TTS xatosi:', e);
+                         avatar.classList.remove('speaking');
+                     };
+                     
+                     // Oldingi ovozni to'xtatish
+                     window.speechSynthesis.cancel();
+                     window.speechSynthesis.speak(utterance);
+                }
+            } else {
+                console.warn("Kechirasiz, TTS brauzeringizda qo'llab-quvvatlanmaydi.");
+            }
+        }
+
+
+        // ====================================================================
+        // FUNKSIYALAR: Firebase va Ma'lumotlarni Boshqarish
+        // ====================================================================
+
+        /**
+         * Firebase dasturini ishga tushiradi va foydalanuvchini autentifikatsiya qiladi.
+         */
+        async function setupFirebase() {
+            const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+
+            if (Object.keys(firebaseConfig).length > 0) {
+                try {
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+
+                    if (typeof __initial_auth_token !== 'undefined') {
+                        await signInWithCustomToken(auth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    userId = auth.currentUser?.uid || crypto.randomUUID();
+                    document.getElementById('user-id-display').textContent = `Foydalanuvchi ID: ${userId}`;
+
+                } catch (error) {
+                    console.error("Firebase yoki autentifikatsiya xatosi:", error);
+                }
+            } else {
+                userId = crypto.randomUUID();
+            }
+        }
+
+        /**
+         * Foydalanuvchi ma'lumotlarini yuklaydi.
+         */
+        async function loadStudentInfo() {
+            if (db && userId) {
+                try {
+                    const docRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/student_data/profile`);
+                    const docSnap = await getDoc(docRef);
+                    if (docSnap.exists()) {
+                        const data = docSnap.data();
+                        // Agar ma'lumotlar mavjud bo'lsa, ularni yuklash
+                        if (data.progress && data.progress.vocabulary !== undefined) return data;
+                    }
+                } catch (error) {
+                    console.error("Foydalanuvchi ma'lumotlarini yuklashda xato:", error);
+                }
+            }
+            const localData = localStorage.getItem('studentInfo');
+            if (localData) {
+                const data = JSON.parse(localData);
+                // Agar local storageda progress 0% bo'lsa, uni yuklash
+                if (data.progress && data.progress.vocabulary !== undefined) return data;
+            }
+
+            // Default 0% li boshlang'ich ma'lumot qaytariladi
+            return { name: '', age: 0, level: 'boshlang\'ich', progress: { vocabulary: 0, grammar: 0, fluency: 0 } };
+        }
+
+        /**
+         * Foydalanuvchi ma'lumotlarini saqlaydi.
+         */
+        async function saveStudentInfo() {
+            if (db && userId) {
+                try {
+                    const docRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/student_data/profile`);
+                    await setDoc(docRef, studentInfo, { merge: true });
+                } catch (error) {
+                    console.error("Foydalanuvchi ma'lumotlarini saqlashda xato:", error);
+                }
+            }
+            localStorage.setItem('studentInfo', JSON.stringify(studentInfo));
+        }
+
+        /**
+         * Suhbat tarixini yuklaydi.
+         */
+        async function loadConversationHistory() {
+            if (db && userId) {
+                try {
+                    const docRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/chat_history/main`);
+                    const docSnap = await getDoc(docRef);
+
+                    if (docSnap.exists() && docSnap.data().history) {
+                        return JSON.parse(docSnap.data().history);
+                    }
+                } catch (error) {
+                    console.error("Suhbat tarixini yuklashda xato:", error);
+                }
+            }
+            const localHistory = localStorage.getItem('conversationHistory');
+            if (localHistory) return JSON.parse(localHistory);
+            return [];
+        }
+
+        /**
+         * Suhbat tarixini saqlaydi.
+         */
+        async function saveConversationHistory() {
+            if (db && userId) {
+                try {
+                    const docRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/chat_history/main`);
+                    await setDoc(docRef, { history: JSON.stringify(conversationHistory) }, { merge: true });
+                } catch (error) {
+                    console.error("Suhbat tarixini saqlashda xato:", error);
+                }
+            }
+            localStorage.setItem('conversationHistory', JSON.stringify(conversationHistory));
+        }
+
+        /**
+         * Real vaqtda tinglashni sozlaydi.
+         */
+        function setupRealtimeListener() {
+            if (db && userId) {
+                const docRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/student_data/profile`);
+                onSnapshot(docRef, (docSnap) => {
+                    if (docSnap.exists()) {
+                        const newInfo = docSnap.data();
+                        // Faqat progress o'zgarganda grafikni yangilash
+                        if (JSON.stringify(newInfo.progress) !== JSON.stringify(studentInfo.progress)) {
+                            studentInfo = newInfo;
+                            updateProgressChart();
+                        }
+                    }
+                });
+            }
+        }
+
+
+        // ====================================================================
+        // FUNKSIYALAR: UI va Chatni Boshqarish
+        // ====================================================================
+
+        /**
+         * O'qituvchi profilini yangilaydi.
+         */
+        function updateTeacherProfile() {
+            const name = teacherGender === 'male' ? 'Professor Alex' : 'Professor Amelia';
+            const avatarUrl = teacherGender === 'male' 
+                ? "https://placehold.co/300x300/1e40af/ffffff?text=Alex"
+                : "https://placehold.co/300x300/ec4899/ffffff?text=Amelia";
+                
+            teacherName.textContent = name;
+            teacherAvatar.src = avatarUrl;
+        }
+
+        /**
+         * O'qituvchining jinsini almashtiradi.
+         */
+        function toggleTeacherGender() {
+            teacherGender = teacherGender === 'male' ? 'female' : 'male';
+            updateTeacherProfile();
+            // Ovozni darhol yangilash va boshqa jinsli ovozga o'tish
+            teacherVoice = null; // Eski ovozni bekor qilish
+            findTeacherVoice(teacherGender); 
+            alertMessage(`O'qituvchi ${teacherGender === 'male' ? 'Professor Alex' : 'Professor Amelia'}ga almashtirildi.`, 'info');
+        }
+
+        /**
+         * Xabarni chat oynasiga qo'shadi.
+         * @param {string} text Xabar matni.
+         * @param {string} sender 'user' yoki 'ai'.
+         */
+        function addMessageToChat(text, sender) {
+            const messageElement = document.createElement('div');
+            // Markdown formatlashni qo'llash (masalan, **qalin** yoki *kursiv*)
+            let formattedText = text
+                .replace(/\*\*\*(.*?)\*\*\*/gs, '<strong class="text-indigo-700">$1</strong>') // Maxsus sarlavhalar
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/\n/g, '<br>');
+
+            messageElement.className = `message ${sender}-message`;
+
+            const avatar = document.createElement('img');
+            avatar.className = 'message-avatar';
+            if (sender === 'ai') {
+                avatar.src = teacherAvatar.src;
+                avatar.alt = teacherName.textContent;
+            } else {
+                avatar.src = "https://placehold.co/300x300/059669/ffffff?text=Siz";
+                avatar.alt = "Siz";
+            }
+
+            const textContent = document.createElement('div');
+            textContent.className = 'message-text';
+            textContent.innerHTML = formattedText; // Yangi qatorlarni va formatlashni saqlash
+
+            if (sender === 'ai') {
+                messageElement.appendChild(avatar);
+                messageElement.appendChild(textContent);
+            } else {
+                messageElement.appendChild(textContent);
+                messageElement.appendChild(avatar);
+            }
+
+            chatBox.appendChild(messageElement);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        /**
+         * Ekranda qisqa xabar ko'rsatish uchun.
+         * @param {string} message Xabar matni.
+         * @param {string} type 'success', 'error', 'info'.
+         */
+        function alertMessage(message, type) {
+            const alertContainer = document.getElementById('alert-container');
+            const alert = document.createElement('div');
+            alert.className = `p-3 rounded-lg shadow-lg mb-2 text-white font-medium text-sm transition-opacity duration-300 ${
+                type === 'success' ? 'bg-green-500' :
+                type === 'error' ? 'bg-red-500' : 'bg-blue-500'
+            }`;
+            alert.textContent = message;
+            alertContainer.appendChild(alert);
+
+            setTimeout(() => {
+                alert.style.opacity = '0';
+                setTimeout(() => alertContainer.removeChild(alert), 300);
+            }, 3000);
+        }
+
+        /**
+         * Ovozli yozishni boshlaydi.
+         */
+        function startRecognition() {
+            if (!('webkitSpeechRecognition' in window)) {
+                alertMessage("Kechirasiz, brauzeringizda ovozli yozish qo'llab-quvvatlanmaydi.", 'error');
+                return;
+            }
+
+            if (recognition) {
+                recognition.stop();
+            }
+
+            recognition = new webkitSpeechRecognition();
+            recognition.continuous = false;
+            recognition.interimResults = false;
+            recognition.lang = 'en-US';
+
+            const micButton = document.getElementById('mic-button');
+            micButton.classList.add('animate-pulse', 'bg-red-600');
+
+            recognition.onresult = function(event) {
+                const transcript = event.results[0][0].transcript;
+                messageInput.value = transcript;
+                micButton.classList.remove('animate-pulse', 'bg-red-600');
+                sendMessage();
+            };
+
+            recognition.onerror = function(event) {
+                console.error("Ovozli yozish xatosi:", event.error);
+                micButton.classList.remove('animate-pulse', 'bg-red-600');
+                alertMessage(`Ovozli yozishda xatolik: ${event.error}`, 'error');
+            };
+
+            recognition.onend = function() {
+                micButton.classList.remove('animate-pulse', 'bg-red-600');
+            };
+
+            recognition.start();
+        }
+
+        /**
+         * Mavzu tugmalarini yaratadi.
+         */
+        function createTopicButtons() {
+            const topics = [
+                'Tanishtiruv', 'Sayohat', 'Ovqatlanish', 'Ishlash', 'Hobby'
+            ];
+            topicButtonsContainer.innerHTML = '';
+            topics.forEach(topic => {
+                const button = document.createElement('button');
+                button.textContent = topic;
+                button.className = `py-2 px-4 rounded-lg shadow-md transition-all duration-200 ${
+                    topic === currentTopic ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-white text-gray-700 hover:bg-indigo-100'
+                }`;
+                button.onclick = () => setTopic(topic);
+                topicButtonsContainer.appendChild(button);
+            });
+        }
+
+        /**
+         * Joriy mavzuni o'rnatadi.
+         */
+        function setTopic(topic) {
+            currentTopic = topic;
+            createTopicButtons();
+            isTaskPending = false;
+            alertMessage(`Mavzu "${topic}" ga o'zgartirildi. Endi bu mavzuda suhbatlashamiz.`, 'info');
+            generateAIResponse(`Start a conversation about the topic: ${topic}. My English level is ${studentInfo.level}. Please speak only English, but if I make a mistake or ask in Uzbek, provide the correction/explanation in Uzbek.`, 'system_message');
+        }
+
+        // ====================================================================
+        // FUNKSIYALAR: AI API Bilan Aloqa va Topshiriqlar
+        // ====================================================================
+
+        /**
+         * Gemini API orqali AI javobini generatsiya qiladi.
+         */
+        async function generateAIResponse(userQuery, type = 'user') {
+            const systemPrompt = `You are Professor Alexman (or Professor Amelia), a professional, kind, and strict English teacher for Uzbek students. Your goal is to help the user practice English speaking and writing based on their current level (which is ${studentInfo.level}).
+            
+            Key Rules:
+            1. **Primary Language:** Conduct the conversation primarily in **English**.
+            2. **Level Adaptation:** You **MUST** strictly match the complexity of your English to the user's level (${studentInfo.level}). Use **ONLY** grammar and vocabulary appropriate for this level.
+            3. **Correction/Explanation:** If the user makes a clear grammatical or vocabulary mistake, or if the user asks a question in **Uzbek**, you **MUST** provide the correction, explanation, or translation entirely in **Uzbek**.
+            4. **Conversation Flow:** Keep your English responses encouraging and relevant to the current topic: ${currentTopic}. Always ask a question at the end of your English turn to keep the conversation going.
+            5. **Do NOT generate any additional feedback or tasks unless the internal system process calls for it. Stick to the role of a conversational teacher.**`;
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            // Oxirgi 10 ta xabar + joriy so'rovni yuborish
+            const historyForApi = conversationHistory.filter(msg => msg.role !== 'system_message').slice(-10);
+            historyForApi.push({ role: "user", parts: [{ text: userQuery }] });
+
+            const payload = {
+                contents: historyForApi,
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+            };
+
+            const loadingIndicator = document.getElementById('loading-indicator');
+            loadingIndicator.classList.remove('hidden');
+            document.getElementById('send-text').textContent = 'Yuklanmoqda...';
+
+            try {
+                for (let i = 0; i < 3; i++) {
+                    const response = await fetch(apiUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload)
+                    });
+
+                    if (response.ok) {
+                        const result = await response.json();
+                        const aiText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+
+                        if (aiText) {
+                            addMessageToChat(aiText, 'ai');
+                            speak(aiText);
+
+                            if (type === 'user') {
+                                conversationHistory.push({ role: "user", parts: [{ text: userQuery }] });
+                            }
+                            conversationHistory.push({ role: "model", parts: [{ text: aiText }] });
+                            await saveConversationHistory();
+                            
+                            // Har 4 ta user xabaridan keyin tahlil va topshiriqni boshqarish
+                            const userMessagesCount = conversationHistory.filter(m => m.role === 'user').length;
+                            if (!isTaskPending && userMessagesCount > 0 && userMessagesCount % 4 === 0 && type === 'user') {
+                                // Agar topshiriq kutilmayotgan bo'lsa va 4 ta xabar yozilgan bo'lsa
+                                isTaskPending = true; // Topshiriqni kutish holatiga o'tkazish
+                                // Oxirgi 8 ta suhbat qismini yuborish
+                                handlePeriodicTask(conversationHistory.slice(-8));
+                            }
+                            return;
+                        }
+                    } else if (response.status === 429 && i < 2) {
+                        const delay = Math.pow(2, i) * 1000;
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    
+                    alertMessage("AI javobini olishda xatolik yuz berdi.", 'error');
+                    break;
+                }
+            } catch (error) {
+                alertMessage("Aloqa xatosi. Internet ulanishingizni tekshiring.", 'error');
+                console.error("Fetch xatosi:", error);
+            } finally {
+                loadingIndicator.classList.add('hidden');
+                document.getElementById('send-text').textContent = 'Yuborish';
+                messageInput.disabled = isTaskPending;
+            }
+        }
+
+        /**
+         * Suhbatni tahlil qiladi, progressni yangilaydi va o'zbek tilida quiz beradi.
+         */
+        async function handlePeriodicTask(recentHistory) {
+             const analysisPrompt = `Analyze the user's latest ${recentHistory.filter(m => m.role === 'user').length} responses from the conversation history below. Based on the user's English (role: 'user'), assess their English usage.
+             
+             Conversation History: ${JSON.stringify(recentHistory)}
+             
+             You MUST generate a short, level-appropriate English language task/quiz (5-8 items, e.g., grammar fill-in-the-blanks, vocabulary matching, sentence construction) related to the current topic and their mistakes. This task MUST be written clearly in English.
+             
+             Provide ONLY a single JSON object in the following format. Do NOT include any other text or explanation outside the JSON.
+             Schema: {
+                "uzbekFeedback": { "type": "STRING", "description": "A detailed, constructive feedback paragraph about their English, written entirely in Uzbek. This paragraph MUST end with the short English language task/quiz (written in English) for the user to complete in the next message. The task should be clearly labeled, e.g., 'TASK: Fill in the blanks: ...'."}
+             }`;
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ parts: [{ text: analysisPrompt }] }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "uzbekFeedback": { "type": "STRING" }
+                        }
+                    }
+                },
+            };
+
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const result = await response.json();
+
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (jsonText) {
+                    const analysis = JSON.parse(jsonText);
+                    
+                    const feedbackMessage = `***O'qituvchi Tahlili va Grammatika Topshirig'i***:\n\n${analysis.uzbekFeedback}\n\n***Sizning Joriy Natijalaringiz:***\n- Lug'at boyligi: ${studentInfo.progress.vocabulary.toFixed(0)}%\n- Grammatika: ${studentInfo.progress.grammar.toFixed(0)}%\n- Ravonlik: ${studentInfo.progress.fluency.toFixed(0)}%`;
+
+                    addMessageToChat(feedbackMessage, 'ai');
+                    alertMessage("Mashq berildi! Davom etish uchun uni bajaring.", 'info');
+                    messageInput.disabled = true;
+                    // isTaskPending avval tepada true qilingan
+                }
+            } catch (error) {
+                console.error("Progressni tahlil qilishda xato:", error);
+                isTaskPending = false; // Xato bo'lsa holatni tiklash
+                messageInput.disabled = false;
+            }
+        }
+        
+        /**
+         * Mashq javobini tahlil qiladi va progressni yangilaydi.
+         */
+        async function analyzeTaskResponse(userAnswer) {
+            const analysisPrompt = `The user's English level is ${studentInfo.level}. They just submitted the following answer to the last assigned English language task/quiz: "${userAnswer}".
+            
+            Evaluate their answer for correctness and completion. Then, calculate the positive change (increase) in their skill progress for a successful attempt. The total increase for a fully correct and complete task is 5 points (Vocabulary +2, Grammar +2, Fluency +1). Adjust these points based on accuracy.
+            
+            Provide ONLY a single JSON object in the following format. Do NOT include any other text or explanation outside the JSON.
+            Schema: {
+                "correctnessFeedback": { "type": "STRING", "description": "Detailed feedback on their quiz answers, including correct answers and explanations for mistakes, written entirely in Uzbek." },
+                "vocabularyIncrease": { "type": "NUMBER", "description": "A number between 0 and 2.0 indicating the gained points." },
+                "grammarIncrease": { "type": "NUMBER", "description": "A number between 0 and 2.0 indicating the gained points." },
+                "fluencyIncrease": { "type": "NUMBER", "description": "A number between 0 and 1.0 indicating the gained points." },
+                "nextQuestion": { "type": "STRING", "description": "A simple, level-appropriate English question to continue the conversation." }
+            }`;
+
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+
+            const payload = {
+                contents: [{ role: "user", parts: [{ text: analysisPrompt }] }],
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "correctnessFeedback": { "type": "STRING" },
+                            "vocabularyIncrease": { "type": "NUMBER" },
+                            "grammarIncrease": { "type": "NUMBER" },
+                            "fluencyIncrease": { "type": "NUMBER" },
+                            "nextQuestion": { "type": "STRING" }
+                        }
+                    }
+                },
+            };
+
+            const loadingIndicator = document.getElementById('loading-indicator');
+            loadingIndicator.classList.remove('hidden');
+            document.getElementById('send-text').textContent = 'Tahlil qilinmoqda...';
+            
+            try {
+                const response = await fetch(apiUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const result = await response.json();
+
+                const jsonText = result.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (jsonText) {
+                    const analysis = JSON.parse(jsonText);
+
+                    // Progressni yangilash (0 dan 100 gacha cheklash)
+                    studentInfo.progress.vocabulary = Math.min(100, (studentInfo.progress.vocabulary) + analysis.vocabularyIncrease);
+                    studentInfo.progress.grammar = Math.min(100, (studentInfo.progress.grammar) + analysis.grammarIncrease);
+                    studentInfo.progress.fluency = Math.min(100, (studentInfo.progress.fluency) + analysis.fluencyIncrease);
+
+                    await saveStudentInfo();
+                    
+                    // Natijalarni ko'rsatish
+                    const resultMessage = `***Mashq Natijalari va Progress***:\n\n${analysis.correctnessFeedback}\n\n***Yangi natijalaringiz:***\n- Lug'at boyligi: ${studentInfo.progress.vocabulary.toFixed(1)}%\n- Grammatika: ${studentInfo.progress.grammar.toFixed(1)}%\n- Ravonlik: ${studentInfo.progress.fluency.toFixed(1)}%`;
+                    addMessageToChat(resultMessage, 'ai');
+                    
+                    // Suhbatni davom ettirish
+                    const continuationMessage = analysis.nextQuestion;
+                    addMessageToChat(continuationMessage, 'ai');
+                    speak(continuationMessage);
+                    conversationHistory.push({ role: "model", parts: [{ text: continuationMessage }] });
+                    await saveConversationHistory();
+
+                    isTaskPending = false; // Topshiriq bajarildi
+                    alertMessage("Mashq muvaffaqiyatli bajarildi! Progressingiz ko'tarildi.", 'success');
+                }
+            } catch (error) {
+                console.error("Mashq javobini tahlil qilishda xato:", error);
+                // Xato bo'lsa ham foydalanuvchiga davom etishga ruxsat berish
+                isTaskPending = false;
+                alertMessage("Mashq tahlilida xatolik yuz berdi. Iltimos, suhbatni davom ettiring.", 'error');
+            } finally {
+                loadingIndicator.classList.add('hidden');
+                document.getElementById('send-text').textContent = 'Yuborish';
+                messageInput.disabled = isTaskPending;
+            }
+        }
+
+        // ====================================================================
+        // FUNKSIYALAR: Grafik va Ilovani Boshlash
+        // ====================================================================
+
+        /**
+         * O'quvchining rivojlanish grafigini chizadi yoki yangilaydi.
+         */
+        function updateProgressChart() {
+            const data = {
+                labels: ['Lug\'at boyligi', 'Grammatika', 'Ravonlik'],
+                datasets: [{
+                    label: 'Ingliz tili rivojlanishi (%)',
+                    data: [
+                        studentInfo.progress.vocabulary,
+                        studentInfo.progress.grammar,
+                        studentInfo.progress.fluency
+                    ],
+                    backgroundColor: [
+                        'rgba(30, 64, 175, 0.8)', // Blue-800
+                        'rgba(5, 150, 105, 0.8)', // Green-600
+                        'rgba(245, 158, 11, 0.8)' // Amber-500
+                    ],
+                    borderColor: [
+                        'rgba(30, 64, 175, 1)',
+                        'rgba(5, 150, 105, 1)',
+                        'rgba(245, 158, 11, 1)'
+                    ],
+                    borderWidth: 1
+                }]
+            };
+
+            const config = {
+                type: 'bar',
+                data: data,
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            max: 100,
+                            title: {
+                                display: true,
+                                text: 'Foiz (%)'
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            display: true
+                        }
+                    }
+                }
+            };
+
+            if (chartInstance) {
+                chartInstance.data = data;
+                chartInstance.update();
+            } else {
+                chartInstance = new Chart(progressChartCanvas, config);
+            }
+        }
+
+        /**
+         * Xabar yuborishni boshqaradi.
+         */
+        function sendMessage() {
+            const message = messageInput.value.trim();
+            if (message === '') return;
+
+            addMessageToChat(message, 'user');
+            messageInput.value = '';
+
+            if (isTaskPending) {
+                // Agar topshiriq kutilayotgan bo'lsa, javobni tahlil qilish
+                analyzeTaskResponse(message);
+            } else {
+                // Oddiy suhbat
+                generateAIResponse(message, 'user');
+            }
+        }
+        
+        /**
+         * Ilovani ishga tushiruvchi asosiy funksiya.
+         */
+        async function startApp() {
+            await setupFirebase();
+
+            // Ovozlar yuklanishini kutish va ovozni tanlash
+            if ('speechSynthesis' in window) {
+                if (window.speechSynthesis.getVoices().length === 0) {
+                    window.speechSynthesis.onvoiceschanged = () => findTeacherVoice(teacherGender);
+                }
+                findTeacherVoice(teacherGender);
+            }
+            
+            updateTeacherProfile();
+            createTopicButtons();
+
+            studentInfo = await loadStudentInfo();
+            conversationHistory = await loadConversationHistory();
+            
+            // isTaskPending ni tiklash
+            isTaskPending = conversationHistory.some(msg => 
+                msg.role === 'model' && msg.parts[0].text.includes('***O\'qituvchi Tahlili va Grammatika Topshirig\'i***')
+            );
+            
+            // Yuklangan xabarlarni chatga qo'shish
+            conversationHistory.forEach(message => { 
+                addMessageToChat(message.parts[0].text, message.role === 'user' ? 'user' : 'ai');
+            });
+
+            // Agar suhbat tarixi bo'sh bo'lsa, boshlang'ich xabarni ko'rsatish
+            if (conversationHistory.length === 0) {
+                const initialMessage = "Assalomu alaykum! Men sizning shaxsiy ingliz tili o'qituvchingiz, Professor Alexman. Darsni boshlashdan oldin siz bilan tanishib olsak. Ismingiz nima, yoshingiz nechada va ingliz tilini qay darajada bilasiz (boshlang'ich, o'rta, yuqori)?";
+                addMessageToChat(initialMessage, 'ai');
+                // Boshlang'ich xabarda faqat o'zbekcha qism bo'lgani uchun, inglizcha qismini qo'lda berish
+                speak("Hello! I am Professor Alexman. Let's start the lesson with an introduction."); 
+                conversationHistory.push({ role: "model", parts: [{ text: initialMessage }] });
+                await saveConversationHistory();
+            }
+
+            updateProgressChart();
+            setupRealtimeListener();
+
+            sendButton.addEventListener('click', sendMessage);
+            messageInput.addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') sendMessage();
+            });
+            teacherGenderToggle.addEventListener('click', toggleTeacherGender);
+            document.getElementById('mic-button').addEventListener('click', startRecognition);
+
+            // Topshiriq kutilayotgan bo'lsa, kiritish maydonini o'chirish
+            messageInput.disabled = isTaskPending;
+            if(isTaskPending) alertMessage("Davom etish uchun avval oxirgi mashqni bajaring.", 'info');
+        }
+
+        window.onload = startApp;
+    </script>
+    <style>
+        /* Tailwind CSS ni qo'l bilan taqlid qilish va asosiy uslublar */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            display: flex;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f2f5; /* Light gray background */
+        }
+        #teacher-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: flex-start; /* Move to top */
+            padding: 30px;
+            background-color: #f5f8ff; /* Light blue/white */
+            box-shadow: 2px 0 10px rgba(0,0,0,0.05);
+            max-width: 400px; /* Max width for desktop */
+            min-width: 300px;
+            overflow-y: auto; /* Agar kontent ko'payib ketsa scroll qilish */
+        }
+        #chat-area {
+            flex: 2;
+            display: flex;
+            flex-direction: column;
+            background-color: #ffffff;
+            box-shadow: -2px 0 10px rgba(0,0,0,0.05);
+        }
+        #teacher-panel img {
+            width: 180px; /* Slightly smaller avatar */
+            height: 180px;
+            border-radius: 50%;
+            border: 6px solid #e0f2fe; /* Light blue border */
+            object-fit: cover;
+            margin-bottom: 20px;
+            transition: border-color 0.3s, transform 0.3s;
+        }
+        #teacher-panel img.speaking {
+            border-color: #3b82f6; /* Blue border when speaking */
+            transform: scale(1.05);
+        }
+        #teacher-name {
+            font-size: 1.8rem;
+            font-weight: 700;
+            color: #1e40af; /* Dark blue text */
+            margin-bottom: 5px;
+        }
+        #teacher-title {
+            font-size: 1rem;
+            color: #6b7280;
+            margin-bottom: 20px;
+        }
+        #progress-container {
+            width: 100%;
+            max-width: 350px;
+            margin-top: 30px;
+            padding: 20px;
+            background-color: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        #progress-container h3 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 15px;
+        }
+        #topic-buttons {
+             display: flex;
+             flex-wrap: wrap;
+             justify-content: center;
+             gap: 8px; /* Tugmalar orasidagi bo'shliq */
+        }
+        #topic-buttons button {
+            font-size: 0.875rem;
+            white-space: nowrap;
+        }
+
+        /* Chat uslublari */
+        #chat-box {
+            flex-grow: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .message {
+            display: flex;
+            align-items: flex-end;
+            max-width: 80%;
+        }
+        .ai-message {
+            margin-right: auto;
+        }
+        .user-message {
+            margin-left: auto;
+            flex-direction: row-reverse; /* Foydalanuvchi avatarini o'ngga surish */
+        }
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            object-fit: cover;
+            margin: 0 10px;
+            border: 2px solid #ccc;
+        }
+        .message-text {
+            padding: 12px 18px;
+            border-radius: 20px;
+            font-size: 1rem;
+            line-height: 1.4;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .ai-message .message-text {
+            background-color: #e0f2fe; /* Light blue bubble */
+            color: #1e40af;
+            border-bottom-left-radius: 5px;
+        }
+        .user-message .message-text {
+            background-color: #059669; /* Green bubble */
+            color: #ffffff;
+            border-bottom-right-radius: 5px;
+        }
+        .message-text strong.text-indigo-700 {
+            color: #3b82f6 !important; /* Tahlil sarlavhasini ajratish */
+            display: block;
+            margin-bottom: 8px;
+            font-size: 1.1rem;
+        }
+
+        /* Kirish maydoni */
+        #input-area {
+            display: flex;
+            padding: 15px;
+            border-top: 1px solid #e5e7eb;
+            background-color: #ffffff;
+            gap: 10px;
+        }
+        #message-input {
+            flex-grow: 1;
+            padding: 12px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 1rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        #message-input:focus {
+            border-color: #3b82f6;
+        }
+        #message-input:disabled {
+            background-color: #f3f4f6;
+            cursor: not-allowed;
+        }
+        #send-button, #mic-button {
+            padding: 12px 15px;
+            border-radius: 8px;
+            color: white;
+            font-weight: 600;
+            transition: background-color 0.2s, transform 0.1s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #send-button {
+            background-color: #3b82f6;
+        }
+        #send-button:hover {
+            background-color: #2563eb;
+        }
+        #mic-button {
+            background-color: #ef4444;
+        }
+        #mic-button:hover {
+            background-color: #dc2626;
+        }
+        #mic-button.animate-pulse {
+            animation: pulse 1s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Mobil qurilmalar uchun uslublar */
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column;
+            }
+            #teacher-panel {
+                max-width: 100%;
+                min-width: 100%;
+                padding: 20px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            #teacher-panel img {
+                width: 100px;
+                height: 100px;
+            }
+            #progress-container {
+                margin-top: 20px;
+                max-width: 100%;
+            }
+            #topic-buttons {
+                display: flex;
+                flex-wrap: wrap;
+                justify-content: center;
+            }
+            #topic-buttons button {
+                margin: 5px 3px;
+                padding: 8px 12px;
+            }
+        }
+    </style>
+</head>
+<body class="antialiased">
+    <!-- Umumiy xabarlar konteyneri -->
+    <div id="alert-container" class="fixed top-4 right-4 z-50 w-64"></div>
+
+    <!-- O'qituvchi Paneli -->
+    <div id="teacher-panel">
+        <div class="flex flex-col items-center">
+            <img id="teacher-avatar" src="https://placehold.co/300x300/1e40af/ffffff?text=Alex" onerror="this.onerror=null; this.src='https://placehold.co/300x300/1e40af/ffffff?text=AI';" alt="Professor Alexman" class="shadow-xl">
+            <h1 id="teacher-name" class="text-3xl">Professor Alex</h1>
+            <p id="teacher-title" class="text-gray-500">AI Ingliz tili o'qituvchisi</p>
+            <p id="user-id-display" class="text-xs text-gray-400 mt-2">Foydalanuvchi ID: yuklanmoqda...</p>
+        </div>
+
+        <button id="teacher-gender-toggle" class="mt-4 py-2 px-4 bg-yellow-500 text-white rounded-lg shadow-md hover:bg-yellow-600 transition-colors">
+            O'qituvchini almashtirish
+        </button>
+
+        <div id="progress-container">
+            <h3 class="text-center">Rivojlanish Grafigi</h3>
+            <div style="height: 250px;">
+                <canvas id="progress-chart"></canvas>
+            </div>
+        </div>
+
+        <div id="topic-container" class="w-full mt-6">
+            <h3 class="text-center text-xl font-semibold mb-3 text-gray-700">Mavzuni tanlash</h3>
+            <div id="topic-buttons" class="flex flex-wrap justify-center gap-2">
+                <!-- Mavzu tugmalari shu yerda yaratiladi -->
+            </div>
+        </div>
+    </div>
+
+    <!-- Chat maydoni -->
+    <div id="chat-area">
+        <!-- Chat xabarlari -->
+        <div id="chat-box">
+            <!-- Xabarlar shu yerda ko'rsatiladi -->
+        </div>
+
+        <!-- Yuborish maydoni -->
+        <div id="input-area">
+            <button id="mic-button" class="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-3 rounded-lg flex items-center justify-center">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-6 h-6">
+                    <path d="M8.25 4.5a3.75 3.75 0 1 1 7.5 0v10.5a3.75 3.75 0 1 1-7.5 0V4.5Z" />
+                    <path fill-rule="evenodd" d="M5.25 15.75A7.501 7.501 0 0 0 12.75 23.25h-1.5a.75.75 0 0 1-.75-.75v-3.75a.75.75 0 0 1 .75-.75h1.5a.75.75 0 0 1 .75.75v3.75a.75.75 0 0 1-.75.75h-1.5A7.501 7.501 0 0 0 5.25 15.75Z" clip-rule="evenodd" />
+                </svg>
+            </button>
+            <input type="text" id="message-input" placeholder="Ingliz tilida xabar yozing yoki mashq javobini kiriting..." class="flex-grow">
+            <button id="send-button">
+                <div id="loading-indicator" class="hidden">
+                    <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                </div>
+                <span id="send-text">Yuborish</span>
+            </button>
+        </div>
+    </div>
+</body>
+</html>
